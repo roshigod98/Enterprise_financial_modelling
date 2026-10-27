@@ -1,0 +1,2 @@
+# Supplier CSVs retain their source CRLF line endings, including the audit copy.
+*.csv whitespace=cr-at-eol

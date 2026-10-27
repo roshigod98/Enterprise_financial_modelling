@@ -1,6 +1,5 @@
 import sys
 from dataclasses import replace
-from math import ceil
 from pathlib import Path
 
 import numpy as np
@@ -15,7 +14,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from model.demand import DemandCurve
-from model.finance import ScenarioInputs, compute_outputs, distribute_profit_after_tax
+from model.finance import ScenarioInputs, compute_outputs, distribute_profit_after_tax, scenario_for_units, ScenarioOutputs
 from model.risk import estimate_likelihoods
 from model.quotes import Quote, load_quotes_csv, pick_unit_cost
 from model.scenarios import (
@@ -23,6 +22,7 @@ from model.scenarios import (
     profit_curve_with_demand,
     profit_heatmap_price_units,
     sweep_profit_over_price,
+    scenario_extrema,
 )
 
 
@@ -35,24 +35,23 @@ def fmt_pct(value: float | None) -> str:
 
 
 def narrative_summary(
-    q,
+    q: Quote,
     x: ScenarioInputs,
-    out,
-    out_worst,
-    out_best,
-    dist,
+    out: ScenarioOutputs,
+    out_worst: ScenarioOutputs,
+    out_best: ScenarioOutputs,
+    dist: dict,
     sell_price_min: float,
     sell_price_max: float,
     units_min: int,
     units_max: int,
     unit_cost_min: float,
     unit_cost_max: float,
-    charity_pct: float,
-):
+) -> list[str]:
     bullets: list[str] = []
 
     bullets.append(
-        f"Using **{q.supplier}** with an order of **{x.order_size_units} decks**, unit cost is about "
+        f"Using **{q.supplier}** with an order of **{out.ordered_units} decks**, unit cost is about "
         f"**{fmt_money(x.unit_cost_gbp, 2)}** (range {fmt_money(unit_cost_min, 2)}–{fmt_money(unit_cost_max, 2)})."
     )
 
@@ -64,26 +63,30 @@ def narrative_summary(
         f"**{fmt_money(out.contribution_margin_gbp, 2)}** per deck."
     )
 
-    trading_be = "not reachable" if out.breakeven_units is None else f"about {out.breakeven_units} units"
-    cash_be = "not reachable" if out.cash_breakeven_units is None else f"about {out.cash_breakeven_units} units"
+    trading_be = "not reachable" if out.breakeven_units is None else f"{out.breakeven_units} units"
+    cash_be = "not reachable" if out.cash_breakeven_units is None else f"{out.cash_breakeven_units} units"
+    if not out.trading_breakeven_feasible:
+        trading_be += " (unreachable within purchased inventory)"
+    if not out.cash_recovery_feasible:
+        cash_be += " (unreachable within purchased inventory)"
     bullets.append(
         f"Upfront cash required is **{fmt_money(out.upfront_cash_gbp)}**; trading break-even is "
-        f"**{trading_be}** and cash break-even is **{cash_be}** (ignoring the grant)."
+        f"**{trading_be}** and cash break-even is **{cash_be}** (before tax and financing)."
     )
 
     bullets.append(
-        f"Profit after tax is **{fmt_money(out.profit_after_tax_gbp)}**; "
+        f"Projected trading profit before tax is **{fmt_money(out.profit_before_tax_gbp)}**; after illustrative tax it is **{fmt_money(out.profit_after_tax_gbp)}**. Cash-limited allocation pool is **{fmt_money(out.distribution_capacity_gbp)}**; "
         f"charity **{fmt_money(dist['charity'])}**, CEO **{fmt_money(dist['ceo'])}**, "
         f"each team member **{fmt_money(dist['others'][0])}**."
     )
 
-    if units_min == units_max and sell_price_min == sell_price_max:
+    if units_min == units_max and sell_price_min == sell_price_max and unit_cost_min == unit_cost_max:
         bullets.append(
             f"Single-point scenario at **{x.units_sold} units**: worst/base/best are identical."
         )
     else:
         bullets.append(
-            f"Range outcomes (PAT) span **{fmt_money(out_worst.profit_after_tax_gbp)}** to "
+            f"Evaluated scenario outcomes (illustrative PAT) span **{fmt_money(out_worst.profit_after_tax_gbp)}** to "
             f"**{fmt_money(out_best.profit_after_tax_gbp)}** across your ranges."
         )
 
@@ -114,22 +117,16 @@ def narrative_summary(
             [(rel_price, "selling price"), (rel_units, "units sold"), (rel_cost, "unit cost")],
             key=lambda x: x[0],
         )[1]
-        driver_note = f"Biggest sensitivity driver (by input range) is **{driver}**."
+        driver_note = f"Widest relative input range is **{driver}**; this is not a measured profit sensitivity."
 
     bullets.append(f"{driver_note} {floor_note}".strip())
 
+    bullets.append(
+        f"Full goodwill-loan repayment after illustrative tax is **{'feasible' if out.loan_repayment_feasible else 'not feasible'}** "
+        f"in this funded cash ledger. Any initial funding gap of **{fmt_money(out.funding_gap_gbp)}** requires external capital. "
+        "Distributions also reserve that capital. Quotes, demand, VAT and settlement timing remain unverified assumptions; these are not historical results."
+    )
     return bullets
-
-
-def effective_order_units(units: int, base_order: int, allow_reorder: bool) -> int:
-    if base_order <= 0:
-        return 0
-    if not allow_reorder:
-        return base_order
-    if units <= base_order:
-        return base_order
-    batches = ceil(units / base_order)
-    return base_order * batches
 
 
 GRANT_CAP = 1000.0
@@ -139,21 +136,38 @@ st.set_page_config(page_title="Enterprise Financial Modeller", layout="wide")
 # --- Header row (left title, right badge) ---
 left, right = st.columns([7, 3])
 with left:
-    st.title("Oundle Branded Playing Cards — Financial Modeller")
+    st.title("The Oundle Deck")
+    st.caption("Financial modelling · Pricing, inventory and funding decisions")
 with right:
     st.markdown(
         """
         <div style="text-align:right; font-size:12px; line-height:1.25; padding-top:6px;">
           <b>Made by Roshan Narayan</b><br/>
-          Oundle School • 2026<br/>
-          Peter Jones Enterprise Tycoon
+          Oundle School · 2026<br/>
+          Peter Jones Foundation Tycoon Enterprise Competition
         </div>
         """,
         unsafe_allow_html=True,
     )
 
+st.caption("Educational what-if scenarios · GBP · 20% illustrative profit tax · VAT treatment unverified")
+
+# Use a restrained shared chart theme, including graphs created with graph_objects.
+import plotly.io as pio
+pio.templates["oundle"] = go.layout.Template(
+    layout=go.Layout(template="plotly_white", colorway=["#172e4d", "#607d94", "#9b8365", "#9cabb5"],
+                     font=dict(family="Arial, sans-serif", color="#172e4d"),
+                     margin=dict(l=30, r=30, t=30, b=40))
+)
+pio.templates.default = "oundle"
+px.defaults.template = "oundle"
+
 # --- Load Data & Sidebar Inputs ---
-quotes = load_quotes_csv("data/quotes_clean.csv")
+try:
+    quotes = load_quotes_csv(str(ROOT / "data" / "quotes_clean.csv"))
+except (OSError, ValueError) as exc:
+    st.error(f"Supplier data could not be loaded: {exc}")
+    st.stop()
 supplier_names = [q.supplier for q in quotes]
 
 with st.sidebar:
@@ -172,6 +186,9 @@ with st.sidebar:
                 "Order size (units)", min_value=1, value=int(custom_moq), step=50
             )
             order_size_int = int(order_size)
+            if order_size_int < custom_moq:
+                st.error(f"Order size is below this supplier's {custom_moq}-deck minimum.")
+                st.stop()
             custom_unit_cost = st.number_input(
                 "Unit cost (£) (for this order size)", min_value=0.0, value=0.80, step=0.01
             )
@@ -211,16 +228,28 @@ with st.sidebar:
             order_size = st.number_input("Order size (units)", min_value=1, value=500, step=50)
             order_size_int = int(order_size)
 
+            if q.moq is not None and order_size_int < q.moq:
+                st.error(f"Order size is below this supplier's {q.moq}-deck minimum. Increase the order or choose another supplier.")
+                st.stop()
+            if q.moq is None:
+                st.caption("Supplier minimum order is unknown; confirm before purchasing.")
             unit_cost, unit_cost_note = pick_unit_cost(q, order_size_int)
             if unit_cost is None:
-                st.error("Missing unit cost data for this row.")
-                st.stop()
+                st.warning("Unit cost is unknown. Enter a confirmed or explicit illustrative assumption.")
+                unit_cost = st.number_input("Missing purchase cost assumption (£)", min_value=0.0, value=1.0)
+                unit_cost_note = "manual assumption; original quote incomplete"
 
-            shipping = q.shipping_cost or 0.0
+            if q.shipping_cost is None:
+                st.warning("Shipping is unknown. It is not included in the supplier ranking.")
+                if not st.checkbox("Use an explicit shipping assumption for this scenario"):
+                    st.stop()
+            shipping = q.shipping_cost if q.shipping_cost is not None else 0.0
             shipping = st.number_input(
                 "Shipping / Fixed Costs (£)", min_value=0.0, value=float(shipping), step=1.0
             )
 
+        if q.vat_included is None:
+            st.caption("Supplier VAT status is unknown; costs use quoted GBP without reclaiming input VAT.")
         st.caption(f"Base Unit Cost: £{unit_cost:.2f} ({unit_cost_note or 'exact'})")
 
         override_cost_flag = st.checkbox("Override Unit Cost")
@@ -333,6 +362,9 @@ with st.sidebar:
                 "Clamp max units", min_value=1, value=int(clamp_max_default), step=50
             )
 
+            if demand_min_units > demand_max_units or (demand_p1 == demand_p2 and demand_u1 != demand_u2):
+                st.error("Use minimum demand ≤ maximum demand and different anchor prices for different quantities.")
+                st.stop()
             demand_curve = DemandCurve(
                 p1=float(demand_p1),
                 u1=int(demand_u1),
@@ -348,17 +380,18 @@ with st.sidebar:
             units_min, units_max = sorted([int(u_at_min), int(u_at_max)])
 
             demand_prices = np.linspace(min(sell_price_min, sell_price_max), max(sell_price_min, sell_price_max), 30)
-            demand_units = [demand_curve.predict_units(float(p)) for p in demand_prices]
+            demand_units = [min(demand_curve.predict_units(float(p)), order_size_int) if not allow_reorder else demand_curve.predict_units(float(p)) for p in demand_prices]
             fig_demand = go.Figure()
             fig_demand.add_trace(
                 go.Scatter(x=demand_prices, y=demand_units, mode="lines", name="Demand curve")
             )
             fig_demand.update_layout(height=200, xaxis_title="Price (£)", yaxis_title="Units")
-            st.plotly_chart(fig_demand, use_container_width=True)
+            st.plotly_chart(fig_demand, width="stretch")
 
     with st.expander("Finance & Distribution", expanded=False):
-        grant = st.number_input("Grant Received (£)", min_value=0.0, value=1000.0, step=50.0)
+        grant = st.number_input("Goodwill loan (funding, £)", min_value=0.0, value=1000.0, step=50.0)
         vat_rate = 0.20
+        st.caption("20% VAT price conversion is illustrative. Choose net price if no output VAT deduction is intended. No card-processing fees apply to school-bill sales.")
 
         with st.expander("Extra costs (optional)", expanded=False):
             extra_fixed = st.number_input("Extra fixed costs (£)", min_value=0.0, value=0.0, step=10.0)
@@ -393,10 +426,6 @@ if not allow_reorder:
     units_min = min(units_min, order_size_int)
     units_max = min(units_max, order_size_int)
 
-order_size_units_base = effective_order_units(units_sold, order_size_int, allow_reorder)
-order_size_units_worst = effective_order_units(units_min, order_size_int, allow_reorder)
-order_size_units_best = effective_order_units(units_max, order_size_int, allow_reorder)
-
 # --- Computations ---
 x = ScenarioInputs(
     vat_rate=vat_rate,
@@ -404,7 +433,8 @@ x = ScenarioInputs(
     sell_price_input=float(sell_price),
     sell_price_is_gross=sell_is_gross,
     units_sold=int(units_sold),
-    order_size_units=order_size_units_base,
+    order_size_units=order_size_int,
+    allow_reorder=allow_reorder,
     unit_cost_gbp=float(unit_cost),
     shipping_cost_gbp=float(shipping),
     setup_cost_gbp=0.0,
@@ -413,37 +443,10 @@ x = ScenarioInputs(
 )
 
 out = compute_outputs(x)
-dist = distribute_profit_after_tax(out.profit_after_tax_gbp, charity_pct, ceo_pct, other_each_pct)
-
-worst = ScenarioInputs(
-    vat_rate=vat_rate,
-    grant_gbp=grant,
-    sell_price_input=float(sell_price_min),
-    sell_price_is_gross=sell_is_gross,
-    units_sold=int(units_min),
-    order_size_units=order_size_units_worst,
-    unit_cost_gbp=float(unit_cost_max),
-    shipping_cost_gbp=float(shipping),
-    setup_cost_gbp=0.0,
-    extra_fixed_costs_gbp=float(extra_fixed),
-    extra_variable_cost_per_unit_gbp=float(extra_var_unit),
+dist = distribute_profit_after_tax(out.distribution_capacity_gbp, charity_pct, ceo_pct, other_each_pct)
+out_worst, out_best = scenario_extrema(
+    x, sell_price_min, sell_price_max, units_min, units_max, unit_cost_min, unit_cost_max, demand_curve,
 )
-best = ScenarioInputs(
-    vat_rate=vat_rate,
-    grant_gbp=grant,
-    sell_price_input=float(sell_price_max),
-    sell_price_is_gross=sell_is_gross,
-    units_sold=int(units_max),
-    order_size_units=order_size_units_best,
-    unit_cost_gbp=float(unit_cost_min),
-    shipping_cost_gbp=float(shipping),
-    setup_cost_gbp=0.0,
-    extra_fixed_costs_gbp=float(extra_fixed),
-    extra_variable_cost_per_unit_gbp=float(extra_var_unit),
-)
-
-out_worst = compute_outputs(worst)
-out_best = compute_outputs(best)
 
 # --- Tabs ---
 tab_overview, tab_range, tab_supplier, tab_distributions, tab_info = st.tabs(
@@ -452,39 +455,32 @@ tab_overview, tab_range, tab_supplier, tab_distributions, tab_info = st.tabs(
 
 # --- TAB 1: OVERVIEW ---
 with tab_overview:
-    k1, k2, k3, k4, k5, k6 = st.columns(6)
-    k1.metric("Profit after tax", fmt_money(out.profit_after_tax_gbp))
-    k2.metric(
-        "Profit / unit (PAT)",
-        "-" if out.profit_per_unit_after_tax is None else fmt_money(out.profit_per_unit_after_tax, 2),
-    )
-    k3.metric("Upfront cash needed", fmt_money(out.upfront_cash_gbp))
-    k4.metric(
-        "Cash break-even units",
-        "-" if out.cash_breakeven_units is None else str(out.cash_breakeven_units),
-    )
-    k5.metric("Effective net margin", fmt_pct(out.effective_net_margin_pct))
-    k6.metric(
-        "Inventory left",
-        "-" if out.inventory_left_units is None else str(out.inventory_left_units),
-    )
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Trading profit before tax", fmt_money(out.profit_before_tax_gbp))
+    k2.metric("Profit after illustrative tax", fmt_money(out.profit_after_tax_gbp))
+    k3.metric("Upfront cash requirement", fmt_money(out.upfront_cash_gbp))
+    k4.metric("Cash recovery (units)", "Unreachable" if not out.cash_recovery_feasible else str(out.cash_breakeven_units))
+    st.caption(f"Inventory remaining: {out.inventory_left_units:,} decks · Net margin: {fmt_pct(out.effective_net_margin_pct)} · Purchased: {out.ordered_units:,} decks")
+    if not out.trading_breakeven_feasible or not out.cash_recovery_feasible:
+        st.warning("At least one break-even target is impossible within the purchased inventory at this price and cost.")
+    st.caption("Reorders buy whole batches at the same unit cost; shipping is charged once. Upfront cash conservatively reserves all batches, without assuming sales finance later orders.")
 
-    st.subheader("Grant cap check")
+    st.subheader("Goodwill loan funding limit")
     upfront_cash = out.upfront_cash_gbp
     ratio = upfront_cash / GRANT_CAP if GRANT_CAP > 0 else 0.0
     st.progress(min(1.0, max(0.0, ratio)))
     if upfront_cash <= GRANT_CAP:
         st.success(
-            f"Upfront cash required is {fmt_money(upfront_cash)} — within the £{int(GRANT_CAP)} grant cap."
+            f"Upfront cash required is {fmt_money(upfront_cash)} — within the £{int(GRANT_CAP)} goodwill loan ceiling."
         )
     else:
         gap = upfront_cash - GRANT_CAP
         st.warning(
-            f"Upfront cash required is {fmt_money(upfront_cash)} — exceeds the £{int(GRANT_CAP)} grant cap "
+            f"Upfront cash required is {fmt_money(upfront_cash)} — exceeds the £{int(GRANT_CAP)} goodwill loan ceiling "
             f"by {fmt_money(gap)}."
         )
 
-    st.subheader("Likelihood (based on your ranges)")
+    st.subheader("What-if scenario coverage")
     demand_mode = units_input_mode == "Demand curve"
     demand_noise = 0.0
     if demand_mode:
@@ -503,18 +499,21 @@ with tab_overview:
         seed=42,
         demand_curve=demand_curve if demand_mode else None,
         demand_noise_pct=demand_noise,
+        base_order_size_units=order_size_int,
+        allow_reorder=allow_reorder,
     )
 
     l1, l2, l3 = st.columns(3)
-    l1.metric("Chance of break-even (PAT ≥ £0)", f"{lik['p_break_even']*100:.0f}%")
-    l2.metric("Chance of paying back grant (PAT ≥ £1000)", f"{lik['p_payback_grant']*100:.0f}%")
-    l3.metric("Chance upfront cash within £1000", f"{lik['p_upfront_within_grant']*100:.0f}%")
+    l1.metric("Scenarios with trading profit", f"{lik['p_break_even']*100:.0f}%")
+    l2.metric("Scenarios repaying loan after tax", f"{lik['p_payback_grant']*100:.0f}%")
+    l3.metric("Scenarios within £1,000 loan cap", f"{lik['p_upfront_within_grant']*100:.0f}%")
     st.caption(
-        "These are simple Monte Carlo estimates based on uniformly sampling within your min/max assumptions "
-        "(not a guarantee)."
+        "Shares of uniformly sampled hypothetical scenarios, NOT empirical probabilities. "
+        "The Tycoon loan is financing, not profit."
     )
 
-    st.markdown("### Narrative Summary (for presenting)")
+    st.caption(f"Pre-tax expenditure recovered in {lik['p_cash_recovery']*100:.0f}% of samples. Seed 42 · 2,000 scenarios. Repayment assumes external capital fills any initial funding gap.")
+    st.markdown("### Scenario narrative")
     bullets = narrative_summary(
         q,
         x,
@@ -528,18 +527,18 @@ with tab_overview:
         units_max,
         unit_cost_min,
         unit_cost_max,
-        charity_pct,
     )
-    st.success("\n".join([f"• {b}" for b in bullets]))
+    with st.container(border=True):
+        for bullet in bullets:
+            st.markdown(f"- {bullet}")
 
     st.subheader("Waterfall: Where the money goes")
-    measures = ["relative", "relative", "relative", "relative", "relative", "total"]
-    xw = ["Revenue", "COGS", "Fixed costs", "Grant", "Tax", "Profit after tax"]
+    measures = ["relative", "relative", "relative", "relative", "total"]
+    xw = ["Revenue", "COGS", "Fixed costs", "Tax", "Profit after tax"]
     yw = [
         out.revenue_gbp,
         -out.cogs_gbp,
         -out.fixed_costs_gbp,
-        x.grant_gbp,
         -out.tax_gbp,
         out.profit_after_tax_gbp,
     ]
@@ -553,7 +552,8 @@ with tab_overview:
         )
     )
     fig_w.update_layout(height=380, yaxis_title="£")
-    st.plotly_chart(fig_w, use_container_width=True)
+    st.plotly_chart(fig_w, width="stretch")
+    st.caption("Repayable goodwill loan proceeds are not trading income. The 20% tax is illustrative.")
 
     st.subheader("Unit economics (per deck)")
     unit_df = pd.DataFrame(
@@ -568,18 +568,22 @@ with tab_overview:
     )
     fig_unit = px.bar(unit_df, x="Component", y="Value", text_auto=".2f", title="")
     fig_unit.update_layout(height=320, yaxis_title="£ per deck", xaxis_title="")
-    st.plotly_chart(fig_unit, use_container_width=True)
+    st.plotly_chart(fig_unit, width="stretch")
 
     st.subheader("Upfront cash composition")
-    batch_cost = out.variable_cost_per_unit_gbp * x.order_size_units
+    batch_cost = out.variable_cost_per_unit_gbp * out.ordered_units
     fixed_costs = out.fixed_costs_gbp
     cash_df = pd.DataFrame(
         {"Component": ["Batch production cost", "Fixed costs"], "Value": [batch_cost, fixed_costs]}
     )
-    fig_cash = px.pie(cash_df, names="Component", values="Value", hole=0.35)
-    fig_cash.update_layout(height=320)
-    st.plotly_chart(fig_cash, use_container_width=True)
+    if cash_df["Value"].sum() > 0:
+        fig_cash = px.pie(cash_df, names="Component", values="Value", hole=0.35)
+        fig_cash.update_layout(height=320)
+        st.plotly_chart(fig_cash, width="stretch")
+    else:
+        st.info("No upfront expenditure under these assumptions.")
 
+    st.caption("Manual scenario bounds evaluate all price/volume/cost corners. Demand-linked bounds sample 201 prices; they are evaluated ranges, not confidence intervals.")
     with st.expander("Range snapshot"):
         p1, p2, p3 = st.columns(3)
         p1.metric("Worst PAT (£)", f"{out_worst.profit_after_tax_gbp:,.0f}")
@@ -629,24 +633,24 @@ with tab_overview:
                 },
             ]
         )
-        st.dataframe(summary, use_container_width=True)
+        st.dataframe(summary, width="stretch")
 
     with st.expander("Detailed metrics"):
         st.markdown(
             f"""
-        **Revenue (net):** {fmt_money(out.revenue_gbp, 2)}  
-        **COGS:** {fmt_money(out.cogs_gbp, 2)}  
-        **Fixed costs:** {fmt_money(out.fixed_costs_gbp, 2)}  
-        **Grant:** {fmt_money(x.grant_gbp, 2)}  
-        **Profit before tax:** {fmt_money(out.profit_before_tax_gbp, 2)}  
-        **Tax (20%):** {fmt_money(out.tax_gbp, 2)}  
-        **Profit after tax:** {fmt_money(out.profit_after_tax_gbp, 2)}  
+        - **Revenue (net):** {fmt_money(out.revenue_gbp, 2)}
+        - **COGS:** {fmt_money(out.cogs_gbp, 2)}
+        - **Fixed costs:** {fmt_money(out.fixed_costs_gbp, 2)}
+        - **Goodwill loan:** {fmt_money(x.grant_gbp, 2)}
+        - **Profit before tax:** {fmt_money(out.profit_before_tax_gbp, 2)}
+        - **Illustrative tax (20%):** {fmt_money(out.tax_gbp, 2)}
+        - **Profit after tax:** {fmt_money(out.profit_after_tax_gbp, 2)}
 
-        ---  
-        **Net price:** {fmt_money(out.sell_price_net, 2)}  
-        **Variable cost / unit:** {fmt_money(out.variable_cost_per_unit_gbp, 2)}  
-        **Contribution / unit:** {fmt_money(out.contribution_margin_gbp, 2)}  
-        **Contribution margin:** {fmt_pct(out.contribution_margin_pct)}
+        ---
+        - **Net price:** {fmt_money(out.sell_price_net, 2)}
+        - **Variable cost / unit:** {fmt_money(out.variable_cost_per_unit_gbp, 2)}
+        - **Contribution / unit:** {fmt_money(out.contribution_margin_gbp, 2)}
+        - **Contribution margin:** {fmt_pct(out.contribution_margin_pct)}
         """
         )
 
@@ -655,39 +659,25 @@ with tab_overview:
     col_chart, col_details = st.columns([2, 1])
 
     with col_chart:
-        st.subheader("Trading Profit vs Units (ignoring grant)")
+        st.subheader("Trading profit vs units (loan excluded)")
 
-        max_u = max(order_size_int, units_max, (out.cash_breakeven_units or 0) * 2, 50)
+        max_u = max(order_size_int, units_max) if allow_reorder else order_size_int
         u_grid = np.unique(np.round(np.linspace(0, max_u, 140)).astype(int))
         u_grid = u_grid[u_grid >= 0]
 
-        profit_curve = []
-        for u in u_grid:
-            order_units_here = effective_order_units(int(u), order_size_int, allow_reorder)
-            xi = ScenarioInputs(
-                vat_rate=vat_rate,
-                grant_gbp=0.0,
-                sell_price_input=float(sell_price),
-                sell_price_is_gross=sell_is_gross,
-                units_sold=int(u),
-                order_size_units=int(order_units_here),
-                unit_cost_gbp=float(unit_cost),
-                shipping_cost_gbp=float(shipping),
-                setup_cost_gbp=0.0,
-                extra_fixed_costs_gbp=float(extra_fixed),
-                extra_variable_cost_per_unit_gbp=float(extra_var_unit),
-            )
-            oi = compute_outputs(xi)
-            profit_curve.append(oi.profit_after_tax_gbp)
+        curve_outputs = [compute_outputs(scenario_for_units(x, int(u))) for u in u_grid]
+        profit_curve = [o.profit_after_tax_gbp for o in curve_outputs]
+        cash_curve = [o.revenue_gbp-o.upfront_cash_gbp for o in curve_outputs]
 
         fig_be = go.Figure()
         fig_be.add_trace(
-            go.Scatter(x=u_grid, y=profit_curve, mode="lines", name="Trading profit after tax (grant=0)")
+            go.Scatter(x=u_grid, y=profit_curve, mode="lines", name="Trading profit after tax")
         )
+        fig_be.add_trace(go.Scatter(x=u_grid, y=cash_curve, mode="lines", name="Net receipts less upfront spend", line=dict(dash="dot")))
         fig_be.add_hline(y=0, line=dict(color="#444", width=1))
 
-        if out.breakeven_units is not None:
-            fig_be.add_vline(x=out.breakeven_units, line=dict(color="#1f77b4", dash="dash"))
+        if out.trading_breakeven_feasible:
+            fig_be.add_vline(x=out.breakeven_units, line=dict(color="#172e4d", dash="dash"))
             fig_be.add_annotation(
                 x=out.breakeven_units,
                 y=0,
@@ -697,12 +687,12 @@ with tab_overview:
                 yshift=18,
             )
 
-        if out.cash_breakeven_units is not None:
+        if out.cash_recovery_feasible and not allow_reorder:
             fig_be.add_vline(x=out.cash_breakeven_units, line=dict(color="#d62728", dash="dot"))
             fig_be.add_annotation(
                 x=out.cash_breakeven_units,
                 y=0,
-                text="Cash BE",
+                text="Pre-tax cash recovery",
                 showarrow=True,
                 arrowhead=2,
                 yshift=-28,
@@ -711,25 +701,25 @@ with tab_overview:
         fig_be.update_layout(
             height=440,
             xaxis_title="Units sold",
-            yaxis_title="Trading profit after tax (£)",
+            yaxis_title="GBP (illustrative trading PAT / pre-tax cash recovery)",
             hovermode="x unified",
         )
-        st.plotly_chart(fig_be, use_container_width=True)
-        st.caption("This chart sets grant=£0 so break-even reflects trading performance only.")
+        st.plotly_chart(fig_be, width="stretch")
+        st.caption("Both curves exclude financing. The cash curve deducts all purchased inventory once, before illustrative tax. Reorders create steps in required cash.")
 
     with col_details:
         st.subheader("Assumptions (midpoint)")
         price_label = "Price (inc VAT)" if sell_is_gross else "Price (ex VAT)"
         st.markdown(
             f"""
-        **{price_label}:** {fmt_money(x.sell_price_input, 2)}  
-        **Net price:** {fmt_money(out.sell_price_net, 2)}  
-        **Units sold:** {x.units_sold}  
-        **Order size:** {x.order_size_units}  
-        **Unit cost:** {fmt_money(x.unit_cost_gbp, 2)}  
-        **Extra variable / unit:** {fmt_money(x.extra_variable_cost_per_unit_gbp, 2)}  
-        **Extra fixed costs:** {fmt_money(x.extra_fixed_costs_gbp, 2)}  
-        **Grant:** {fmt_money(x.grant_gbp, 2)}  
+        - **{price_label}:** {fmt_money(x.sell_price_input, 2)}
+        - **Net price:** {fmt_money(out.sell_price_net, 2)}
+        - **Units sold:** {x.units_sold}
+        - **Purchased inventory:** {out.ordered_units}
+        - **Unit cost:** {fmt_money(x.unit_cost_gbp, 2)}
+        - **Extra variable / unit:** {fmt_money(x.extra_variable_cost_per_unit_gbp, 2)}
+        - **Extra fixed costs:** {fmt_money(x.extra_fixed_costs_gbp, 2)}
+        - **Goodwill loan:** {fmt_money(x.grant_gbp, 2)}
         """
         )
 
@@ -750,7 +740,7 @@ with tab_overview:
 # --- TAB 2: EXPLORE RANGES ---
 with tab_range:
     if units_input_mode == "Demand curve" and demand_curve is not None:
-        st.subheader("Likely profit vs price (demand curve)")
+        st.subheader("Illustrative profit vs price (assumed demand)")
         prices, units_pred, profits = profit_curve_with_demand(
             base=x,
             price_min=float(sell_price_min),
@@ -788,7 +778,7 @@ with tab_range:
                     y=lo,
                     mode="lines",
                     fill="tonexty",
-                    fillcolor="rgba(30, 144, 255, 0.20)",
+                    fillcolor="rgba(96, 125, 148, 0.22)",
                     line=dict(width=0),
                     name="Profit range (cost uncertainty)",
                 )
@@ -799,23 +789,23 @@ with tab_range:
                 x=prices,
                 y=profits,
                 mode="lines",
-                name="Likely profit (PAT)",
-                line=dict(width=3, color="#1f77b4"),
+                name="Illustrative trading PAT",
+                line=dict(width=3, color="#172e4d"),
             )
         )
         fig_profit.add_hline(y=0, line=dict(color="#444", width=1))
         fig_profit.update_layout(
             height=420, xaxis_title="Selling price (£)", yaxis_title="Profit after tax (£)"
         )
-        st.plotly_chart(fig_profit, use_container_width=True)
+        st.plotly_chart(fig_profit, width="stretch")
 
-        st.subheader("Predicted units vs price")
+        st.subheader("Assumed units vs price")
         fig_units = go.Figure()
         fig_units.add_trace(
-            go.Scatter(x=prices, y=units_pred, mode="lines", name="Predicted units")
+            go.Scatter(x=prices, y=units_pred, mode="lines", name="Assumed units")
         )
         fig_units.update_layout(height=320, xaxis_title="Selling price (£)", yaxis_title="Units")
-        st.plotly_chart(fig_units, use_container_width=True)
+        st.plotly_chart(fig_units, width="stretch")
     else:
         st.subheader("Profit across selling price range")
 
@@ -826,12 +816,12 @@ with tab_range:
             st.warning(
                 "Selling price range is a single value — switch to Range mode to see the band and landscape."
             )
-            max_u = max(order_size_int, units_max, 50)
+            max_u = max(order_size_int, units_max) if allow_reorder else order_size_int
             units_curve = np.unique(np.round(np.linspace(0, max_u, 80)).astype(int))
             units_curve = units_curve[units_curve >= 0]
             profits = []
             for u in units_curve:
-                xi = replace(x, sell_price_input=float(sell_price_min), units_sold=int(u))
+                xi = scenario_for_units(replace(x, sell_price_input=float(sell_price_min)), int(u))
                 profits.append(compute_outputs(xi).profit_after_tax_gbp)
             fig_line = go.Figure()
             fig_line.add_trace(
@@ -841,7 +831,7 @@ with tab_range:
             fig_line.update_layout(
                 height=420, xaxis_title="Units sold", yaxis_title="Profit after tax (£)"
             )
-            st.plotly_chart(fig_line, use_container_width=True)
+            st.plotly_chart(fig_line, width="stretch")
         else:
             if units_collapsed:
                 st.warning("Units range is a single value — the band collapses to a line.")
@@ -863,7 +853,7 @@ with tab_range:
                     x=prices,
                     y=p_hi,
                     mode="lines",
-                    name="Best case (high units, low cost)",
+                    name="Maximum evaluated PAT",
                     line=dict(width=0),
                     showlegend=False,
                 )
@@ -873,9 +863,9 @@ with tab_range:
                     x=prices,
                     y=p_lo,
                     mode="lines",
-                    name="Profit range (low units & high cost → high units & low cost)",
+                    name="Envelope across volume and cost extremes",
                     fill="tonexty",
-                    fillcolor="rgba(0, 200, 255, 0.25)",
+                    fillcolor="rgba(96, 125, 148, 0.22)",
                     line=dict(width=0),
                 )
             )
@@ -889,7 +879,7 @@ with tab_range:
                     y=mid_profit,
                     mode="lines",
                     name="Mid scenario",
-                    line=dict(width=3, color="#1f77b4"),
+                    line=dict(width=3, color="#172e4d"),
                 )
             )
             fig_band.add_hline(y=0, line=dict(color="#444", width=1))
@@ -899,7 +889,7 @@ with tab_range:
                 yaxis_title="Profit after tax (£)",
                 hovermode="x unified",
             )
-            st.plotly_chart(fig_band, use_container_width=True)
+            st.plotly_chart(fig_band, width="stretch")
 
         st.subheader("Profit landscape (price × units)")
         if price_collapsed or units_collapsed:
@@ -922,7 +912,8 @@ with tab_range:
                     x=prices_h,
                     y=units_h,
                     z=z,
-                    colorbar=dict(title="Profit (£)"),
+                    colorbar=dict(title="Illustrative PAT (£)"),
+                    colorscale="RdBu", zmid=0,
                     hovertemplate="Price £%{x:.2f}<br>Units %{y}<br>Profit £%{z:,.0f}<extra></extra>",
                 )
             )
@@ -939,37 +930,39 @@ with tab_range:
                 )
             )
             fig_h.update_layout(height=520, xaxis_title="Selling price (£)", yaxis_title="Units sold")
-            st.plotly_chart(fig_h, use_container_width=True)
+            st.plotly_chart(fig_h, width="stretch")
 
 # --- TAB 3: SUPPLIER COMPARE ---
 with tab_supplier:
     st.subheader("Supplier comparison (same selling assumptions)")
 
+    st.caption("Indicative historical quotes; unknown shipping/costs and orders below known MOQ are excluded. Fallback price tiers and unverified VAT are shown explicitly. Costs stay on the quoted GBP basis without input VAT reclaim.")
     rows: list[dict] = []
     for quote in quotes:
         supplier_cost, note = pick_unit_cost(quote, order_size_int)
-        if supplier_cost is None:
+        if supplier_cost is None or quote.shipping_cost is None or (quote.moq is not None and order_size_int < quote.moq):
             rows.append(
                 {
                     "Supplier": quote.supplier,
-                    "Unit Cost (£)": None,
-                    "Shipping (£)": quote.shipping_cost or 0.0,
+                    "Unit Cost (£)": supplier_cost,
+                    "Shipping (£)": quote.shipping_cost,
                     "Profit After Tax (£)": None,
                     "ROI on Upfront (%)": None,
                     "Break-even Units": None,
-                    "Notes": "Missing unit cost",
+                    "Notes": "Incomplete cost/shipping or order below MOQ; excluded from ranking",
                 }
             )
             continue
 
-        shipping_cost = quote.shipping_cost or 0.0
+        shipping_cost = quote.shipping_cost
         scenario = ScenarioInputs(
             vat_rate=vat_rate,
             grant_gbp=grant,
             sell_price_input=float(sell_price),
             sell_price_is_gross=sell_is_gross,
             units_sold=int(units_sold),
-            order_size_units=order_size_units_base,
+            order_size_units=order_size_int,
+            allow_reorder=allow_reorder,
             unit_cost_gbp=float(supplier_cost),
             shipping_cost_gbp=float(shipping_cost),
             setup_cost_gbp=0.0,
@@ -985,33 +978,40 @@ with tab_supplier:
                 "Profit After Tax (£)": result.profit_after_tax_gbp,
                 "ROI on Upfront (%)": result.roi_on_upfront_pct,
                 "Break-even Units": result.breakeven_units,
-                "Notes": note or "",
+                "Notes": "; ".join(filter(None, [note, "VAT unknown" if quote.vat_included is None else "VAT included" if quote.vat_included else "VAT excluded", "MOQ unknown" if quote.moq is None else ""])),
             }
         )
 
     df = pd.DataFrame(rows)
     if not df.empty:
         df = df.sort_values(by="Profit After Tax (£)", ascending=False, na_position="last")
-    st.dataframe(df, use_container_width=True)
+    st.dataframe(df, width="stretch", column_config={
+        name: st.column_config.NumberColumn(format="£%.2f")
+        for name in ("Unit Cost (£)", "Shipping (£)", "Profit After Tax (£)")
+    })
 
     df2 = df.dropna(subset=["Profit After Tax (£)"]).copy()
     if not df2.empty:
+        df2["Supplier label"] = df2["Supplier"].map(lambda name: name if len(name) <= 38 else name[:35] + "…")
         fig_bar = px.bar(
             df2.head(10),
-            x="Supplier",
-            y="Profit After Tax (£)",
-            title="Top suppliers by profit after tax",
+            x="Profit After Tax (£)",
+            y="Supplier label",
+            orientation="h",
+            hover_name="Supplier",
+            title="Complete quotes: illustrative profit after tax",
             text_auto=".0f",
         )
-        fig_bar.update_layout(height=420)
-        st.plotly_chart(fig_bar, use_container_width=True)
+        fig_bar.update_layout(height=420, yaxis_title="", yaxis=dict(categoryorder="total ascending"), xaxis=dict(tickprefix="£"))
+        st.plotly_chart(fig_bar, width="stretch")
 
 # --- TAB 4: DISTRIBUTIONS ---
 with tab_distributions:
     st.subheader("Projected Profit Distribution")
 
-    if out.profit_after_tax_gbp <= 0 or dist.get("distributable", 0.0) <= 0:
-        st.warning("No distributable profit after tax in this scenario.")
+    st.caption(f"Accounting PAT: {fmt_money(out.profit_after_tax_gbp, 2)} · Cash-limited allocation pool: {fmt_money(out.distribution_capacity_gbp, 2)}. Loan repayment and external capital recovery are reserved before charity/team allocations.")
+    if out.distribution_capacity_gbp <= 0:
+        st.warning("No illustrative payout until trading is profitable and upfront cash is recoverable.")
     else:
         labels = [
             "Charity",
@@ -1041,13 +1041,13 @@ with tab_distributions:
                 hole=0.35,
             )
             fig_pie.update_layout(height=360, showlegend=True)
-            st.plotly_chart(fig_pie, use_container_width=True)
+            st.plotly_chart(fig_pie, width="stretch")
 
         with c_dist_2:
             st.markdown(
                 f"""
             ### Payout Values
-            * **Distributable (after tax + charity):** {fmt_money(dist['distributable'], 2)}
+            * **Team pool (after tax, capital recovery + charity):** {fmt_money(dist['distributable'], 2)}
             * **Charity:** {fmt_money(dist['charity'], 2)}
             * **CEO:** {fmt_money(dist['ceo'], 2)}
             * **Team Member 1:** {fmt_money(dist['others'][0], 2)}
@@ -1067,14 +1067,14 @@ with tab_info:
             """
 **Prices and VAT**
 - **Customer price (inc VAT)** is what buyers pay.
-- **Net price (ex VAT)** is what the business keeps before costs.
-- Net price = Gross price / 1.20 (VAT rate = 20%).
+- **Net price (ex VAT)** is the modelled price before costs, after any illustrative VAT conversion.
+- Illustrative net price = Gross price / 1.20. VAT registration and actual school treatment are unverified.
 
 **Revenue, costs, and profit**
 - **Revenue (net)** = Net selling price × Units sold
 - **COGS** = Variable cost per unit × Units sold
 - **Fixed costs** = Shipping + Setup + extra fixed costs
-- **Profit before tax** = Revenue + Grant − (COGS + Fixed costs)
+- **Profit before tax** = Revenue − (COGS + Fixed costs). The goodwill loan is repayable financing, not profit.
 - **Profit after tax (PAT)** = Profit before tax − tax
 
 **Unit economics**
@@ -1086,13 +1086,13 @@ with tab_info:
 """
         )
 
-    with st.expander("Break-even (ignoring grant)", expanded=True):
+    with st.expander("Break-even (excluding loan financing)", expanded=True):
         st.markdown(
             """
 Break-even is the smallest number of units sold where trading alone covers costs.
 
 - **Break-even units** = ceil(Fixed costs ÷ Contribution per unit)
-- **Cash break-even** = ceil(Upfront cash ÷ Contribution per unit)
+- **Cash break-even** = ceil(Upfront cash ÷ Net selling price): the supplier inventory purchase has already been paid upfront, so it must not be deducted again when recovering cash.
 """
         )
 
@@ -1114,10 +1114,11 @@ Units are then clamped to a min/max range.
             """
 Distribution uses this pipeline:
 1. **Profit before tax**
-2. **Tax (20%)**
+2. **Illustrative tax (20%)**
 3. **Profit after tax (PAT)**
-4. **Charity** = 30% of PAT (if PAT > 0)
-5. **Split** the remainder: CEO 45%, team members 11% each (x5)
+4. **Cash-limited pool** = smaller of positive PAT and cash after tax, full loan repayment and external capital recovery
+5. **Charity** = 30% of that pool (default)
+6. **Split** the remainder: CEO 45%, team members 11% each (x5)
 """
         )
 
@@ -1125,11 +1126,11 @@ Distribution uses this pipeline:
         st.markdown(
             """
 - **Profit vs Units (break-even)**: where the line crosses 0 profit is the trading break-even.
-- **Waterfall**: shows how revenue is reduced by COGS, fixed costs and tax to arrive at PAT.
+- **Waterfall**: shows trading revenue minus COGS, fixed costs and illustrative tax to arrive at PAT. Loan funding is not profit.
 - **Profit band**: shaded region shows uncertainty across unit and cost ranges.
 - **Heatmap**: profit across price × units; the contour line is the break-even boundary.
 - **Supplier bar chart**: compares PAT across suppliers under the same assumptions.
-If **demand curve** mode is on, the heatmap is replaced by likely profit vs price and predicted units vs price.
+If **demand curve** mode is on, the heatmap is replaced by illustrative profit vs price and assumed units vs price.
 """
         )
 
@@ -1143,23 +1144,24 @@ If **demand curve** mode is on, the heatmap is replaced by likely profit vs pric
 """
         )
 
-    with st.expander("Grant cap warning and likelihood estimates", expanded=True):
+    with st.expander("Funding and scenario sampling", expanded=True):
         st.markdown(
             f"""
-### Grant cap warning (why it exists)
-We show a warning when **upfront cash needed** exceeds **£{int(GRANT_CAP)}** (the maximum grant).  
+### Goodwill loan funding ceiling (why it exists)
+We show a warning when **upfront cash needed** exceeds **£{int(GRANT_CAP)}** (the maximum goodwill loan).
 This highlights whether the business can place the production order without extra funding.
 
-**Upfront cash needed** (ignoring the grant):
+**Upfront cash needed** (before loan funding):
 - Upfront cash = (Order size × Variable cost per deck) + Fixed upfront costs
 
 ### Likelihood metrics (how they are calculated)
 We estimate:
-- **Chance of break-even**: % of sampled scenarios where **profit after tax (PAT) ≥ £0**
-- **Chance of paying back grant**: % of sampled scenarios where **PAT ≥ £{int(GRANT_CAP)}**
-- **Chance upfront cash within grant**: % where upfront cash needed ≤ £{int(GRANT_CAP)}
+- **Trading profit**: % of samples with trading profit before tax ≥ £0.
+- **Cash recovery**: % of samples where net sales receipts cover upfront expenditure, before tax.
+- **Loan repayment feasible**: % of samples where the funded cash ledger can repay principal after illustrative tax.
+- **Within funding cap**: % of samples with initial expenditure ≤ £{int(GRANT_CAP)}.
 
-**Method**: we randomly sample prices/costs/units inside your chosen ranges (Monte Carlo sampling).  
-This is a practical risk indicator, not a guarantee.
+**Method**: we randomly sample prices/costs/units inside your chosen ranges (Monte Carlo sampling).
+These are percentages of hypothetical scenarios, not calibrated real-world probabilities. The 20% tax/VAT assumptions are illustrative and must be checked with school finance.
 """
         )
