@@ -216,7 +216,9 @@ with st.sidebar:
                 st.error("Missing unit cost data for this row.")
                 st.stop()
 
-            shipping = q.shipping_cost or 0.0
+            if q.shipping_cost is None:
+                st.warning("Shipping is unquoted: the £0 default is not verified.")
+            shipping = q.shipping_cost if q.shipping_cost is not None else 0.0
             shipping = st.number_input(
                 "Shipping / Fixed Costs (£)", min_value=0.0, value=float(shipping), step=1.0
             )
@@ -357,7 +359,7 @@ with st.sidebar:
             st.plotly_chart(fig_demand, use_container_width=True)
 
     with st.expander("Finance & Distribution", expanded=False):
-        grant = st.number_input("Grant Received (£)", min_value=0.0, value=1000.0, step=50.0)
+        grant = st.number_input("Goodwill loan (funding, £)", min_value=0.0, value=1000.0, step=50.0)
         vat_rate = 0.20
 
         with st.expander("Extra costs (optional)", expanded=False):
@@ -413,7 +415,12 @@ x = ScenarioInputs(
 )
 
 out = compute_outputs(x)
-dist = distribute_profit_after_tax(out.profit_after_tax_gbp, charity_pct, ceo_pct, other_each_pct)
+cash_recovered = out.revenue_gbp >= out.upfront_cash_gbp
+# Display illustrative distributions only after funding outlay can be recovered.
+dist = distribute_profit_after_tax(
+    out.profit_after_tax_gbp if cash_recovered else 0.0,
+    charity_pct, ceo_pct, other_each_pct,
+)
 
 worst = ScenarioInputs(
     vat_rate=vat_rate,
@@ -469,22 +476,22 @@ with tab_overview:
         "-" if out.inventory_left_units is None else str(out.inventory_left_units),
     )
 
-    st.subheader("Grant cap check")
+    st.subheader("Goodwill loan funding limit")
     upfront_cash = out.upfront_cash_gbp
     ratio = upfront_cash / GRANT_CAP if GRANT_CAP > 0 else 0.0
     st.progress(min(1.0, max(0.0, ratio)))
     if upfront_cash <= GRANT_CAP:
         st.success(
-            f"Upfront cash required is {fmt_money(upfront_cash)} — within the £{int(GRANT_CAP)} grant cap."
+            f"Upfront cash required is {fmt_money(upfront_cash)} — within the £{int(GRANT_CAP)} goodwill loan ceiling."
         )
     else:
         gap = upfront_cash - GRANT_CAP
         st.warning(
-            f"Upfront cash required is {fmt_money(upfront_cash)} — exceeds the £{int(GRANT_CAP)} grant cap "
+            f"Upfront cash required is {fmt_money(upfront_cash)} — exceeds the £{int(GRANT_CAP)} goodwill loan ceiling "
             f"by {fmt_money(gap)}."
         )
 
-    st.subheader("Likelihood (based on your ranges)")
+    st.subheader("What-if scenario coverage")
     demand_mode = units_input_mode == "Demand curve"
     demand_noise = 0.0
     if demand_mode:
@@ -503,15 +510,17 @@ with tab_overview:
         seed=42,
         demand_curve=demand_curve if demand_mode else None,
         demand_noise_pct=demand_noise,
+        base_order_size_units=order_size_int,
+        allow_reorder=allow_reorder,
     )
 
     l1, l2, l3 = st.columns(3)
-    l1.metric("Chance of break-even (PAT ≥ £0)", f"{lik['p_break_even']*100:.0f}%")
-    l2.metric("Chance of paying back grant (PAT ≥ £1000)", f"{lik['p_payback_grant']*100:.0f}%")
-    l3.metric("Chance upfront cash within £1000", f"{lik['p_upfront_within_grant']*100:.0f}%")
+    l1.metric("Scenarios with trading profit", f"{lik['p_break_even']*100:.0f}%")
+    l2.metric("Scenarios recovering upfront spend", f"{lik['p_payback_grant']*100:.0f}%")
+    l3.metric("Scenarios within £1,000 loan cap", f"{lik['p_upfront_within_grant']*100:.0f}%")
     st.caption(
-        "These are simple Monte Carlo estimates based on uniformly sampling within your min/max assumptions "
-        "(not a guarantee)."
+        "Shares of uniformly sampled hypothetical scenarios, NOT empirical probabilities. "
+        "The Tycoon loan is financing, not profit."
     )
 
     st.markdown("### Narrative Summary (for presenting)")
@@ -530,16 +539,17 @@ with tab_overview:
         unit_cost_max,
         charity_pct,
     )
-    st.success("\n".join([f"• {b}" for b in bullets]))
+    with st.container(border=True):
+        for bullet in bullets:
+            st.markdown(f"- {bullet}")
 
     st.subheader("Waterfall: Where the money goes")
-    measures = ["relative", "relative", "relative", "relative", "relative", "total"]
-    xw = ["Revenue", "COGS", "Fixed costs", "Grant", "Tax", "Profit after tax"]
+    measures = ["relative", "relative", "relative", "relative", "total"]
+    xw = ["Revenue", "COGS", "Fixed costs", "Tax", "Profit after tax"]
     yw = [
         out.revenue_gbp,
         -out.cogs_gbp,
         -out.fixed_costs_gbp,
-        x.grant_gbp,
         -out.tax_gbp,
         out.profit_after_tax_gbp,
     ]
@@ -554,6 +564,7 @@ with tab_overview:
     )
     fig_w.update_layout(height=380, yaxis_title="£")
     st.plotly_chart(fig_w, use_container_width=True)
+    st.caption("Repayable goodwill loan proceeds are not trading income. The 20% tax is illustrative.")
 
     st.subheader("Unit economics (per deck)")
     unit_df = pd.DataFrame(
@@ -637,7 +648,7 @@ with tab_overview:
         **Revenue (net):** {fmt_money(out.revenue_gbp, 2)}  
         **COGS:** {fmt_money(out.cogs_gbp, 2)}  
         **Fixed costs:** {fmt_money(out.fixed_costs_gbp, 2)}  
-        **Grant:** {fmt_money(x.grant_gbp, 2)}  
+        **Goodwill loan:** {fmt_money(x.grant_gbp, 2)}  
         **Profit before tax:** {fmt_money(out.profit_before_tax_gbp, 2)}  
         **Tax (20%):** {fmt_money(out.tax_gbp, 2)}  
         **Profit after tax:** {fmt_money(out.profit_after_tax_gbp, 2)}  
@@ -655,7 +666,7 @@ with tab_overview:
     col_chart, col_details = st.columns([2, 1])
 
     with col_chart:
-        st.subheader("Trading Profit vs Units (ignoring grant)")
+        st.subheader("Trading profit vs units (loan excluded)")
 
         max_u = max(order_size_int, units_max, (out.cash_breakeven_units or 0) * 2, 50)
         u_grid = np.unique(np.round(np.linspace(0, max_u, 140)).astype(int))
@@ -682,7 +693,7 @@ with tab_overview:
 
         fig_be = go.Figure()
         fig_be.add_trace(
-            go.Scatter(x=u_grid, y=profit_curve, mode="lines", name="Trading profit after tax (grant=0)")
+            go.Scatter(x=u_grid, y=profit_curve, mode="lines", name="Trading profit after tax")
         )
         fig_be.add_hline(y=0, line=dict(color="#444", width=1))
 
@@ -715,7 +726,7 @@ with tab_overview:
             hovermode="x unified",
         )
         st.plotly_chart(fig_be, use_container_width=True)
-        st.caption("This chart sets grant=£0 so break-even reflects trading performance only.")
+        st.caption("The repayable goodwill loan is excluded from trading profit and break-even.")
 
     with col_details:
         st.subheader("Assumptions (midpoint)")
@@ -729,7 +740,7 @@ with tab_overview:
         **Unit cost:** {fmt_money(x.unit_cost_gbp, 2)}  
         **Extra variable / unit:** {fmt_money(x.extra_variable_cost_per_unit_gbp, 2)}  
         **Extra fixed costs:** {fmt_money(x.extra_fixed_costs_gbp, 2)}  
-        **Grant:** {fmt_money(x.grant_gbp, 2)}  
+        **Goodwill loan:** {fmt_money(x.grant_gbp, 2)}  
         """
         )
 
@@ -1011,7 +1022,7 @@ with tab_distributions:
     st.subheader("Projected Profit Distribution")
 
     if out.profit_after_tax_gbp <= 0 or dist.get("distributable", 0.0) <= 0:
-        st.warning("No distributable profit after tax in this scenario.")
+        st.warning("No illustrative payout until trading is profitable and upfront cash is recoverable.")
     else:
         labels = [
             "Charity",
