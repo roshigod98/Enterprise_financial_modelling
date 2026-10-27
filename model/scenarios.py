@@ -56,10 +56,16 @@ def profit_band_over_price(
     c_lo, c_hi = sorted([float(unit_cost_min), float(unit_cost_max)])
 
     for i, p in enumerate(prices):
-        worst = replace(base, sell_price_input=float(p), units_sold=u_lo, unit_cost_gbp=c_hi)
-        best = replace(base, sell_price_input=float(p), units_sold=u_hi, unit_cost_gbp=c_lo)
-        lo[i] = compute_outputs(worst).profit_after_tax_gbp
-        hi[i] = compute_outputs(best).profit_after_tax_gbp
+        # All corners matter: more sales can actually *reduce* profit if the
+        # unit contribution is negative. Min/max input values are not probabilities.
+        outcomes = [
+            compute_outputs(
+                replace(base, sell_price_input=float(p), units_sold=u, unit_cost_gbp=c)
+            ).profit_after_tax_gbp
+            for u in (u_lo, u_hi)
+            for c in (c_lo, c_hi)
+        ]
+        lo[i], hi[i] = min(outcomes), max(outcomes)
 
     return prices, lo, hi
 
