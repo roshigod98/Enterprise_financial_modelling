@@ -8,7 +8,7 @@ from typing import Optional
 @dataclass(frozen=True)
 class ScenarioInputs:
     vat_rate: float = 0.20
-    grant_gbp: float = 1000.0
+    grant_gbp: float = 1000.0  # Tycoon goodwill loan (financing, not turnover)
 
     sell_price_input: float = 0.0      # user enters
     sell_price_is_gross: bool = True   # inc VAT?
@@ -67,8 +67,9 @@ def compute_outputs(x: ScenarioInputs) -> ScenarioOutputs:
 
     fixed_costs = x.shipping_cost_gbp + x.setup_cost_gbp + x.extra_fixed_costs_gbp
 
-    # Operating profit (before tax). Grant included here as income, but not used in break-even.
-    pbt = revenue + x.grant_gbp - (cogs + fixed_costs)
+    # Loan principal is repayable funding and must not be included in profit.
+    # The 20% profit-tax calculation is a *project assumption*, not tax advice.
+    pbt = revenue - (cogs + fixed_costs)
 
     tax = 0.20 * pbt if pbt > 0 else 0.0
     pat = pbt - tax
@@ -91,8 +92,11 @@ def compute_outputs(x: ScenarioInputs) -> ScenarioOutputs:
     upfront_cash = (variable_per_unit * order_units) + fixed_costs
 
     cash_be = None
-    if contribution > 0 and upfront_cash > 0:
-        cash_be = ceil(upfront_cash / contribution)
+    if sell_net > 0 and upfront_cash > 0:
+        # The whole inventory batch was already paid for upfront. Cash is
+        # replenished through receipts; subtracting unit cost again here
+        # would count the inventory purchase twice.
+        cash_be = ceil(upfront_cash / sell_net)
 
     roi_upfront = None
     if upfront_cash > 0:
