@@ -21,15 +21,18 @@ def estimate_likelihoods(
     seed: int = 42,
     demand_curve: Optional[object] = None,
     demand_noise_pct: float = 0.0,
+    base_order_size_units: Optional[int] = None,
+    allow_reorder: bool = False,
 ) -> dict[str, float]:
     """
     Monte Carlo likelihood estimates based on uniformly sampling within ranges.
 
     - If demand_curve is provided, units are derived from price via demand_curve.predict_units(price).
       Optional multiplicative noise can be applied via demand_noise_pct (e.g. 0.10 = ±10%).
-    - Break-even is defined as profit_after_tax >= 0.
-    - Grant payback is defined as profit_after_tax >= grant_cap_gbp (before charity/team payout).
-    - Upfront within grant is defined as upfront_cash_gbp <= grant_cap_gbp.
+    - Trading break-even: pretax trading profit >= 0 (loan excluded).
+    - Repayment feasible: net sales receipts cover the initial cash outlay.
+    - Funding cap: upfront outlay <= loan cap.
+    Uniform what-if sampling yields *scenario shares*, not calibrated probabilities.
     """
     rng = np.random.default_rng(seed)
 
@@ -53,25 +56,35 @@ def estimate_likelihoods(
             noise = rng.uniform(1 - demand_noise_pct, 1 + demand_noise_pct, size=n)
             u_samples = np.round(u_samples * noise).astype(int)
 
-    max_units = max(0, int(getattr(base, "order_size_units", 0)), int(max(units_min, units_max)))
-    u_samples = np.clip(u_samples, 0, max_units)
+    batch_size = int(base_order_size_units or base.order_size_units)
+    if batch_size < 1:
+        raise ValueError("order size must be at least one")
+    u_samples = np.maximum(u_samples, 0)
+    if not allow_reorder:
+        u_samples = np.minimum(u_samples, batch_size)
 
-    pat = np.zeros(n, dtype=float)
+    pbt = np.zeros(n, dtype=float)
+    receipts = np.zeros(n, dtype=float)
     upfront = np.zeros(n, dtype=float)
 
     for i in range(n):
+        units = int(u_samples[i])
+        ordered = max(batch_size, ((units + batch_size - 1) // batch_size) * batch_size) if allow_reorder else batch_size
         xi = replace(
             base,
             sell_price_input=float(p_samples[i]),
             unit_cost_gbp=float(c_samples[i]),
-            units_sold=int(u_samples[i]),
+            units_sold=units,
+            order_size_units=ordered,
         )
         out = compute_outputs(xi)
-        pat[i] = out.profit_after_tax_gbp
+        pbt[i] = out.profit_before_tax_gbp
+        receipts[i] = out.revenue_gbp
         upfront[i] = out.upfront_cash_gbp
 
-    p_break_even = float(np.mean(pat >= 0.0))
-    p_payback_grant = float(np.mean(pat >= grant_cap_gbp))
+    p_break_even = float(np.mean(pbt >= -1e-9))
+    # Financing can be repaid once trading receipts have recovered the outlay.
+    p_payback_grant = float(np.mean(receipts >= upfront - 1e-9))
     p_upfront_within_grant = float(np.mean(upfront <= grant_cap_gbp))
 
     return {
