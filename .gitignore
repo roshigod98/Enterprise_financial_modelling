@@ -1,0 +1,24 @@
+# Python environments and generated artifacts
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.egg-info/
+
+# IDE and OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Local settings, secrets and temporary files
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+*.log
