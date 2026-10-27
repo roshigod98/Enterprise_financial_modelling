@@ -3,9 +3,11 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import Optional
 
+from model.demand import DemandCurve
+
 import numpy as np
 
-from model.finance import ScenarioInputs, compute_outputs
+from model.finance import ScenarioInputs, compute_outputs, effective_order_units
 
 
 def estimate_likelihoods(
@@ -19,10 +21,10 @@ def estimate_likelihoods(
     grant_cap_gbp: float = 1000.0,
     n: int = 2000,
     seed: int = 42,
-    demand_curve: Optional[object] = None,
+    demand_curve: Optional[DemandCurve] = None,
     demand_noise_pct: float = 0.0,
     base_order_size_units: Optional[int] = None,
-    allow_reorder: bool = False,
+    allow_reorder: bool | None = None,
 ) -> dict[str, float]:
     """
     Monte Carlo likelihood estimates based on uniformly sampling within ranges.
@@ -30,10 +32,16 @@ def estimate_likelihoods(
     - If demand_curve is provided, units are derived from price via demand_curve.predict_units(price).
       Optional multiplicative noise can be applied via demand_noise_pct (e.g. 0.10 = ±10%).
     - Trading break-even: pretax trading profit >= 0 (loan excluded).
-    - Repayment feasible: net sales receipts cover the initial cash outlay.
+    - Repayment feasible: funded cash ledger can repay principal after illustrative tax.
     - Funding cap: upfront outlay <= loan cap.
     Uniform what-if sampling yields *scenario shares*, not calibrated probabilities.
     """
+    if n < 1 or not isinstance(n, int):
+        raise ValueError("n must be a positive integer")
+    if not 0 <= demand_noise_pct <= 1:
+        raise ValueError("demand_noise_pct must be 0..1")
+    price_min, price_max = sorted((price_min, price_max))
+    unit_cost_min, unit_cost_max = sorted((unit_cost_min, unit_cost_max))
     rng = np.random.default_rng(seed)
 
     p_samples = rng.uniform(price_min, price_max, size=n)
@@ -56,7 +64,8 @@ def estimate_likelihoods(
             noise = rng.uniform(1 - demand_noise_pct, 1 + demand_noise_pct, size=n)
             u_samples = np.round(u_samples * noise).astype(int)
 
-    batch_size = int(base_order_size_units or base.order_size_units)
+    allow_reorder = base.allow_reorder if allow_reorder is None else allow_reorder
+    batch_size = int(base_order_size_units if base_order_size_units is not None else base.order_size_units)
     if batch_size < 1:
         raise ValueError("order size must be at least one")
     u_samples = np.maximum(u_samples, 0)
@@ -64,31 +73,35 @@ def estimate_likelihoods(
         u_samples = np.minimum(u_samples, batch_size)
 
     pbt = np.zeros(n, dtype=float)
-    receipts = np.zeros(n, dtype=float)
+    recovered = np.zeros(n, dtype=bool)
+    repayable = np.zeros(n, dtype=bool)
     upfront = np.zeros(n, dtype=float)
 
     for i in range(n):
         units = int(u_samples[i])
-        ordered = max(batch_size, ((units + batch_size - 1) // batch_size) * batch_size) if allow_reorder else batch_size
+        ordered = effective_order_units(units, batch_size, allow_reorder)
         xi = replace(
             base,
             sell_price_input=float(p_samples[i]),
             unit_cost_gbp=float(c_samples[i]),
             units_sold=units,
             order_size_units=ordered,
+            allow_reorder=False,
         )
         out = compute_outputs(xi)
         pbt[i] = out.profit_before_tax_gbp
-        receipts[i] = out.revenue_gbp
+        recovered[i] = out.revenue_gbp >= out.upfront_cash_gbp - 1e-9
+        repayable[i] = out.loan_repayment_feasible
         upfront[i] = out.upfront_cash_gbp
 
     p_break_even = float(np.mean(pbt >= -1e-9))
-    # Financing can be repaid once trading receipts have recovered the outlay.
-    p_payback_grant = float(np.mean(receipts >= upfront - 1e-9))
+    # Loan repayment and pre-tax expenditure recovery are different tests.
+    p_payback_grant = float(np.mean(repayable))
     p_upfront_within_grant = float(np.mean(upfront <= grant_cap_gbp))
 
     return {
         "p_break_even": p_break_even,
+        "p_cash_recovery": float(np.mean(recovered)),
         "p_payback_grant": p_payback_grant,
         "p_upfront_within_grant": p_upfront_within_grant,
     }

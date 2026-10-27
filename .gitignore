@@ -22,3 +22,7 @@ Thumbs.db
 !.env.example
 .streamlit/secrets.toml
 *.log
+*.tmp
+*.bak
+playwright-report/
+test-results/

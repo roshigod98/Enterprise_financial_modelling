@@ -1,65 +1,117 @@
 # Model assumptions and financial definitions
 
-This is an educational *scenario model*, not audited accounts or tax advice. The financial calculations are intended to make commercial choices inspectable.
+This educational scenario model is not audited accounts or a determination of
+UK tax liability. Reported enterprise results are separate from model outputs.
+All displayed amounts are GBP. School-bill sales have **no card-processing fees**.
 
-## Core inputs
+## Inputs and accounting basis
 
-- `sell_price_input`: user-entered customer selling price per deck. When `sell_price_is_gross=True`, the model divides by `1 + vat_rate` to produce an illustrative net price.
-- `unit_cost_gbp`: supplier purchase cost per deck at the selected quantity.
-- `extra_variable_cost_per_unit_gbp`: additional per-deck cost.
-- `units_sold` (`U`): number of decks sold.
-- `order_size_units` (`Q`): decks bought, including any modelled reorders.
-- `shipping_cost_gbp`, `setup_cost_gbp` and `extra_fixed_costs_gbp`: fixed costs.
-- `grant_gbp`: **legacy code name**; used for Tycoon *goodwill loan* amount. The funding is repayable financing and does not enter profit.
+`P` is the modelled net selling price, `C` is supplier cost plus extra variable
+cost per deck, `U` is units sold, `Q` is total purchased inventory, and `F` is
+shipping + setup + extra fixed expenditure. Additional per-deck costs are assumed
+to be committed for the full purchased quantity, preserving the project's
+original cash assumption. Unsold inventory remains at cost; no write-down or
+salvage income is assumed.
 
-## Calculations
+Customer-price mode uses `P = entered price / (1 + 0.20)`; net-price mode uses
+the entered price directly. **VAT registration, input VAT recovery and the school's
+actual financial treatment are unverified.** Purchase costs stay on their quoted
+GBP basis, with no automatic input VAT adjustment. Set the price mode deliberately;
+do not interpret this convention as confirmation of taxes payable.
 
-Let `P` be net price, `C` be supplier-plus-variable cost per deck, and `F` be total fixed costs.
+Inputs must be finite and nonnegative, with integer quantities. Sales cannot
+exceed purchased inventory without explicit reorders. Zero sales and losses are
+valid scenarios, with undefined percentage margins shown as a dash.
 
-| Measure | Formula | Interpretation |
-| --- | --- | --- |
-| Net revenue | `P × U` | Turnover, excluding modelled VAT |
-| COGS | `C × U` | Cost attributed to decks sold |
-| Trading profit before tax | `(P - C) × U - F` | Excludes loan funding |
-| Illustrative tax | `0.20 × max(PBT, 0)` | Simplified *assumption*, not actual tax liability |
-| Profit after illustrative tax | `PBT - tax` | The app's PAT |
-| Contribution per deck | `P - C` | Incremental profit before fixed costs |
-| Contribution margin | `(P - C) / P` | Undefined when `P=0` |
-| Upfront cash requirement | `Q × C + F` | Cash to pay for all ordered inventory and initial expenses |
-| Trading break-even | `ceil(F/(P-C))`, if `P>C` | First count covering fixed costs on a per-sale P&L basis |
-| Cash recovery units | `ceil((Q×C + F)/P)`, if `P>0` | Units whose *net receipts* recover upfront cash |
-| Inventory remaining | `max(Q-U, 0)` | Bought decks not yet sold |
-| PAT per unit | `PAT/U` | Undefined if no sales |
-| Effective net margin | `PAT/(P×U)` | Undefined if revenue is zero |
+## Trading performance and cash recovery
 
-**Why the distinction matters:** Trading break-even can show zero when fixed costs are zero, although substantial cash was used to buy inventory. Conversely, the full-batch inventory purchase is already counted in upfront cash and must not be charged *again* through a contribution-margin denominator in the cash-recovery calculation.
+| Measure | Formula |
+| --- | --- |
+| Net revenue | `P × U` |
+| COGS | `C × U` |
+| Trading profit before tax (PBT) | `P × U − C × U − F` |
+| Illustrative profit tax | `20% × max(PBT, 0)` |
+| Illustrative profit after tax (PAT) | `PBT − illustrative tax` |
+| Contribution per deck | `P − C` |
+| Upfront cash requirement | `Q × C + F` |
+| Trading break-even | `ceil(F / (P − C))` when contribution is positive |
+| Cash recovery units | `ceil((Q × C + F) / P)` when net price is positive |
+| Inventory remaining | `Q − U` |
+| ROI on upfront expenditure | `PAT / upfront × 100` |
 
-Cash recovery is feasible within a single batch only when `cash_recovery_units <= Q`. This model does not forecast dates when sales cash will reach the school's account.
+At zero fixed costs, trading is at zero profit at zero sales, even if subsequent
+sales lose money. With positive fixed costs and nonpositive contribution, trading
+break-even is impossible. Zero upfront expenditure is recovered at zero sales;
+otherwise zero-price sales cannot recover it. A numerical threshold beyond `Q`
+is explicitly labelled unreachable within purchased inventory. Cash recovery is
+**before illustrative tax and financing**, and the denominator is net receipts,
+not contribution: inventory has already been purchased upfront.
 
-## Repayable Tycoon funding
+## Goodwill loan, external capital and distributions
 
-The official programme calls startup support a **goodwill loan**, and sets a **£1,000 per-school ceiling for KS3–4** in the relevant competition category. The loan is repayable to the Peter Jones Foundation; teams may allocate profits after repayment. The initial funding is **not revenue**. [Official FAQ](https://tycoon.com/faqs/) · [Rules](https://tycoon.com/terms-conditions/)
+The £1,000 goodwill-loan ceiling is a **project funding assumption**. The legacy
+API name `grant_gbp` means repayable loan principal `L`, never revenue or trading
+profit. Official programme background: [Tycoon FAQ](https://tycoon.com/faqs/) and
+[terms](https://tycoon.com/terms-conditions/). Confirm current rules independently.
 
-The dashboard's simplified *loan repayment feasibility* test asks whether net trading receipts can recover all upfront outlay. This is conservative and **does not replace a cash ledger** of initial loan disbursement, unspent loan cash, repayment timetable, VAT settlements, and school-bill collections.
+The single-period ledger assumes that external capital fills any initial gap
+`E = max(upfront − L, 0)`. Its displayed gap must actually be funded for the
+scenario to proceed. With net receipts collected and illustrative tax reserved:
 
-For illustrative purposes only, after a positive post-tax trading result and sufficient cash recovery, the app can allocate 30% to charity and split the remainder 45% to the CEO and 11% each to five team members. These percentages are user-selectable assumptions, **not verified distributions** or Foundation rules.
+- Cash before loan repayment = `L + E + revenue − upfront − tax`.
+- Full repayment is feasible if that cash is at least `L`.
+- Cash after full repayment = cash before repayment minus `L`; a negative value
+  represents a shortfall, not an actual repayment made.
+- Cash available after also recovering external capital = `revenue − upfront − tax`.
+- Allocation pool = `min(max(PAT, 0), max(cash available after capital recovery, 0))`.
 
-## VAT, tax and accounting caveats
+This prevents accounting profit held in unsold stock from being distributed as
+cash. Loan principal is repaid from the ledger; it is **not deducted from PAT**.
+Unspent loan proceeds remain cash and are never distributed as earned profit.
+Default charity is **30% of the available allocation pool**, followed by **45% to
+the CEO and 11% each to five members** of the remaining team pool. With sufficient
+cash this is the original PAT allocation; insufficient cash reduces the pool.
+These are illustrative allocations, not verified payments or competition rules.
+At 100% charity all available allocation goes to charity, with no team payout.
 
-The code uses a 20% VAT price adjustment and flat 20% profit-tax illustration. Whether the business should actually deduct output VAT, reclaim input VAT or pay corporation tax depends on its legal and school finance arrangements. Real cash, tax and accounting profit can therefore differ substantially from the displayed scenario. Before public financial claims, verify treatment with the school's finance staff.
+## Inventory and reorders
 
-Unknown supplier shipping, VAT status and MOQ values are **not £0**. Some blank cells are temporarily exposed as editable zero-cost *placeholders* in the dashboard; these scenarios should be treated as **incomplete quotes**, not verified supplier economics.
+Without reorders, charts and simulations cap assumed sales at the original batch.
+With reorders, whole batches of that size are bought: `Q = max(batch, ceil(U/batch) × batch)`.
+The model conservatively reserves cash for **all** those batches upfront. It does
+not assume earlier sales finance later purchases. Supplier unit price stays fixed,
+and shipping, setup and other fixed costs are charged **once per scenario**.
+Repeated shipping, price-tier changes, delivery timing and intra-period funding
+are not modelled. A cash-recovery marker refers to the currently modelled purchased
+quantity; the cash curve shows steps when reorder quantities change.
 
-The simplified P&L charges fixed shipping once, and COGS for units sold. Multiple production batches may require repeated shipping or different supplier unit prices: both remain model limitations.
+## Scenarios, demand and Monte Carlo
 
-## Range charts and Monte Carlo
+Manual scenario extrema evaluate all price/volume/cost corners, including cases
+where higher sales increase a loss. Bands evaluate all volume/cost corners at each
+price; these are envelopes, not confidence intervals. Heatmaps represent independent
+hypothetical price/volume combinations. Their zero contour is trading break-even.
 
-- Manual price/volume heatmaps plot hypothetical combinations of prices and units; they do **not** imply those combinations are equally likely.
-- The price band evaluates four input extremes of volume and unit cost at each price; it is a mathematical envelope, **not a statistical confidence interval**.
-- Optional demand mode interpolates between user-chosen `(price, units)` anchor points and clips to minimum and maximum quantities. It is not an empirically estimated demand curve.
-- `model/risk.py` samples uniform selling prices and unit costs, and uniform integer quantities (or quantities from the assumed demand curve), using a fixed reproducible seed. Its returned values are **fractions of deliberately generated scenarios**, not calibrated predictions of a real business's success chances.
-- Modelling assumptions such as stock constraints and reorders must be held consistent when reading the outputs.
+Demand uses two user-selected anchors and linear interpolation/extrapolation,
+rounded to integer decks and clipped to demand limits and available inventory.
+Identical prices require identical quantities. Rising demand anchors are allowed
+as an explicit user assumption; the model does not enforce an economic law.
+Demand-linked scenario bounds sample **201 prices**, retaining price/volume
+correlation. They are evaluated bounds, not guaranteed continuous extrema.
 
-## Known limitations / next research steps
+Monte Carlo samples uniform prices and costs and uniform integer sales, or the
+assumed demand curve with optional bounded multiplicative noise. The default uses
+**2,000 samples and seed 42**. Inventory, tax and repayment use the same finance
+functions as the rest of the app. Scenario shares are **not calibrated commercial
+probabilities or verified outcomes**. Re-running unchanged inputs is reproducible;
+changing assumptions changes the experiment. The widest relative input range in
+the narrative is a description of inputs, not a measured financial sensitivity.
 
-Source timestamps and supplier quotes should be independently verified; demand can be fitted to actual sales or a designed willingness-to-pay experiment; school-bill settlement dates, inventory write-downs and remaining goodwill-loan cash should be modelled explicitly; and any after-tax payout should be checked against actual school finance and charity policies.
+## Data and limitations
+
+See [supplier data audit](DATA_NOTES.md) for CSV alignment repairs and the retained
+original. Missing shipping/costs exclude supplier rankings; unknown MOQ and VAT
+remain visible. Fallback price tiers are assumptions, not confirmed quotes at the
+selected order size. Historical prices, supplier identity, import charges, demand,
+collection dates, VAT settlements, competition rules and actual profit
+appropriations require confirmation before a real decision.

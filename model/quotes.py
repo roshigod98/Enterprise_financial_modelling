@@ -1,6 +1,7 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
+from math import isfinite
 from typing import Optional
 
 import pandas as pd
@@ -47,6 +48,8 @@ def load_quotes_csv(path: str) -> list[Quote]:
         # Resolve relative paths against project root (parent of /model).
         p = Path(__file__).resolve().parents[1] / p
     df = pd.read_csv(p)
+    if "Supplier" not in df.columns:
+        raise ValueError("Supplier column is required")
     quotes: list[Quote] = []
 
     for _, r in df.iterrows():
@@ -57,12 +60,17 @@ def load_quotes_csv(path: str) -> list[Quote]:
             if v is None:
                 return None
             try:
-                return float(v)
-            except ValueError:
-                return None
+                value = float(v)
+            except ValueError as exc:
+                raise ValueError(f"{f('Supplier')}: invalid {col}: {v}") from exc
+            if not isfinite(value) or value < 0:
+                raise ValueError(f"{f('Supplier')}: {col} must be finite and nonnegative")
+            return value
 
         def num_int(col):
             v = num(col)
+            if v is not None and not v.is_integer():
+                raise ValueError(f"{col} must be an integer")
             return int(v) if v is not None else None
 
         vat_flag_raw = f("VATIncludedFlag")
@@ -94,6 +102,10 @@ def load_quotes_csv(path: str) -> list[Quote]:
             notes=f("Notes"),
         ))
 
+    for q in quotes:
+        if q.unit_cost_500 is not None and q.total_cost_500 is not None:
+            if abs(q.unit_cost_500 * 500 - q.total_cost_500) > 1.0:
+                raise ValueError(f"{q.supplier}: 500-unit quote does not match total; check CSV alignment")
     # drop empty supplier rows
     return [q for q in quotes if q.supplier]
 
