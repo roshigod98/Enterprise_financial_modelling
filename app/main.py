@@ -1085,7 +1085,7 @@ with tab_info:
 - **Revenue (net)** = Net selling price × Units sold
 - **COGS** = Variable cost per unit × Units sold
 - **Fixed costs** = Shipping + Setup + extra fixed costs
-- **Profit before tax** = Revenue + Grant − (COGS + Fixed costs)
+- **Profit before tax** = Revenue − (COGS + Fixed costs). The goodwill loan is repayable financing, not profit.
 - **Profit after tax (PAT)** = Profit before tax − tax
 
 **Unit economics**
@@ -1103,7 +1103,7 @@ with tab_info:
 Break-even is the smallest number of units sold where trading alone covers costs.
 
 - **Break-even units** = ceil(Fixed costs ÷ Contribution per unit)
-- **Cash break-even** = ceil(Upfront cash ÷ Contribution per unit)
+- **Cash break-even** = ceil(Upfront cash ÷ Net selling price): the supplier inventory purchase has already been paid upfront, so it must not be deducted again when recovering cash.
 """
         )
 
@@ -1136,7 +1136,7 @@ Distribution uses this pipeline:
         st.markdown(
             """
 - **Profit vs Units (break-even)**: where the line crosses 0 profit is the trading break-even.
-- **Waterfall**: shows how revenue is reduced by COGS, fixed costs and tax to arrive at PAT.
+- **Waterfall**: shows trading revenue minus COGS, fixed costs and illustrative tax to arrive at PAT. Loan funding is not profit.
 - **Profit band**: shaded region shows uncertainty across unit and cost ranges.
 - **Heatmap**: profit across price × units; the contour line is the break-even boundary.
 - **Supplier bar chart**: compares PAT across suppliers under the same assumptions.
@@ -1157,20 +1157,20 @@ If **demand curve** mode is on, the heatmap is replaced by likely profit vs pric
     with st.expander("Grant cap warning and likelihood estimates", expanded=True):
         st.markdown(
             f"""
-### Grant cap warning (why it exists)
-We show a warning when **upfront cash needed** exceeds **£{int(GRANT_CAP)}** (the maximum grant).  
+### Goodwill loan funding ceiling (why it exists)
+We show a warning when **upfront cash needed** exceeds **£{int(GRANT_CAP)}** (the maximum goodwill loan).  
 This highlights whether the business can place the production order without extra funding.
 
-**Upfront cash needed** (ignoring the grant):
+**Upfront cash needed** (before loan funding):
 - Upfront cash = (Order size × Variable cost per deck) + Fixed upfront costs
 
 ### Likelihood metrics (how they are calculated)
 We estimate:
-- **Chance of break-even**: % of sampled scenarios where **profit after tax (PAT) ≥ £0**
-- **Chance of paying back grant**: % of sampled scenarios where **PAT ≥ £{int(GRANT_CAP)}**
-- **Chance upfront cash within grant**: % where upfront cash needed ≤ £{int(GRANT_CAP)}
+- **Trading profit**: % of samples with trading profit before tax ≥ £0.
+- **Cash recovery / loan repayment feasible**: % of samples where net sales receipts cover upfront expenditure.
+- **Within funding cap**: % of samples with initial expenditure ≤ £{int(GRANT_CAP)}.
 
 **Method**: we randomly sample prices/costs/units inside your chosen ranges (Monte Carlo sampling).  
-This is a practical risk indicator, not a guarantee.
+These are percentages of hypothetical scenarios, not calibrated real-world probabilities. The 20% tax/VAT assumptions are illustrative and must be checked with school finance.
 """
         )
